@@ -29,7 +29,7 @@ set / timesteps.
 
 
 import collections
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Callable, Dict, Generator, Iterable, NamedTuple, Optional, Tuple, Union, Any
 
 import jax
@@ -119,8 +119,10 @@ def gradient_descent_mse(
   Args:
     k_train_train:
       kernel on the training data. Must have the shape of
-      `zip(y_train.shape, y_train.shape)` with `trace_axes` absent.
-
+      `zip(y_train.shape, y_train.shape)` with `trace_axes` absent,
+      or a `Callable` that takes an argument `b`, the RHS of a vector
+      to multiply the kernel by, and a `get` argument for the type of
+      kernel to compute.
     y_train:
       targets for the training data.
 
@@ -159,7 +161,6 @@ def gradient_descent_mse(
     `predict_fn(t, fx_train_0, fx_test_0, k_test_train)` that
     returns output train [and test] set[s] predictions at time[s] `t`.
   """
-  _, odd, first, _ = _get_axes(k_train_train)
   trace_axes = utils.canonicalize_axis(trace_axes, y_train)
   trace_axes = tuple(-y_train.ndim + a for a in trace_axes)
   n_t_axes, n_non_t_axes = len(trace_axes), y_train.ndim - len(trace_axes)
@@ -185,6 +186,7 @@ def gradient_descent_mse(
         return fx_train_t
 
       rhs = y_train if fx_train_0 is None else y_train - fx_train_0
+      _, odd, first, _ = _get_axes(k_test_train)
       dfx_test = np.tensordot(k_test_train, solve(rhs, trace_axes),
                               (odd, first))
       dfx_test = np.moveaxis(dfx_test, last_t_axes, trace_axes)
@@ -227,6 +229,7 @@ def gradient_descent_mse(
 
       if fx_test_0 is not None:
         dfx_test = inv_expm1_fn(rhs, t).reshape(shape)
+        _, odd, first, _ = _get_axes(k_test_train)
         dfx_test = np.tensordot(k_test_train, dfx_test, (odd, non_t_axes))
         dfx_test = np.moveaxis(
             dfx_test,
@@ -604,12 +607,12 @@ def gp_inference(
     k_train_train:
       train-train kernel. Can be (a) :class:`jax.numpy.ndarray`, (b) `Kernel`
       namedtuple, (c) :class:`neural_tangents.Kernel` object, (d) `Callable`
-      that takes an argument `b, the RHS of a vector to multiply the kernel by.
-      Must contain the necessary `nngp` and/or `ntk` kernels for arguments
-      provided to the returned `predict_fn` function. For example, if you
-      request to compute posterior test [only] NTK covariance in future
-      `predict_fn` invocations, `k_train_train` must contain both `ntk` and
-      `nngp` kernels.
+      that takes an argument `b`, the RHS of a vector to multiply the kernel
+      by, and a `get` argument for the type of kernel to compute.  Must contain
+      the necessary `nngp` and/or `ntk` kernels for arguments provided to the
+      returned `predict_fn` function. For example, if you request to compute
+      posterior test [only] NTK covariance in future `predict_fn` invocations,
+      `k_train_train` must contain both `ntk` and `nngp` kernels.
 
     y_train:
       train targets.
@@ -647,7 +650,6 @@ def gp_inference(
     computing 'posterior' Gaussian distribution (mean or mean and covariance)
     on a given test set.
   """
-  even, odd, first, last = _get_axes(_get_first(k_train_train))
   trace_axes = utils.canonicalize_axis(trace_axes, y_train)
 
   if method not in ('chol', 'cg'):
@@ -655,14 +657,16 @@ def gp_inference(
 
   @lru_cache(2)
   def solve(g: str):
-    k_dd = _get_attr(k_train_train, g)
-
+    if not callable(k_train_train):
+      k_dd = _get_attr(k_train_train, g)
+    else:
+      k_dd = k_train_train
     if method == 'chol':
       if callable(k_dd):
         raise ValueError('k_train_train must be a ndarray with method==\'chol\'')
       return _get_cho_solve(k_dd, diag_reg, diag_reg_absolute_scale)
     elif method == 'cg':
-      return _get_cg_solve(k_dd, diag_reg, diag_reg_absolute_scale, **cg_kwargs)
+      return _get_cg_solve(k_dd, diag_reg, diag_reg_absolute_scale, get=g, **cg_kwargs)
 
   @lru_cache(2)
   def k_inv_y(g: str):
@@ -718,7 +722,11 @@ def gp_inference(
 
     for g in get:
       k = g if g != 'ntkgp' else 'ntk'
-      k_dd = _get_attr(k_train_train, k)
+      if not callable(k_train_train):
+         k_dd = _get_attr(k_train_train, k)
+      else:
+         k_dd = k_train_train
+
       k_td = None if k_test_train is None else _get_attr(k_test_train, k)
 
       if k_td is None:
@@ -726,6 +734,7 @@ def gp_inference(
         y = y_train.astype(k_dd.dtype)
       else:
         # Test set predictions.
+        even, odd, first, last = _get_axes(_get_first(k_td))
         y = np.tensordot(k_td, k_inv_y(k), (odd, first))
         y = np.moveaxis(y, range(-len(trace_axes), 0), trace_axes)
 
@@ -1294,9 +1303,12 @@ def _get_cho_solve(A: np.ndarray,
 def _get_cg_solve(A: Union[np.ndarray, Callable],
                   diag_reg: float,
                   diag_reg_absolute_scale: bool,
+                  get: str,
                   **kwargs) -> Callable[[Union[np.ndarray, Callable], Axes],
                                                np.ndarray]:
 
+  if callable(A):
+    A = partial(A, get=get)
   A = _add_diagonal_regularizer(A, diag_reg, diag_reg_absolute_scale)
 
   def cg_solve(b: Union[np.ndarray, Callable], b_axes: Axes) -> np.ndarray:

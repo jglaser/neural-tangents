@@ -31,6 +31,8 @@ from neural_tangents import predict, stax
 from neural_tangents._src.predict import _is_on_cpu
 from tests import test_utils
 
+from neural_tangents._src.utils import utils
+
 from collections import namedtuple
 
 config.parse_flags_with_absl()
@@ -1085,9 +1087,7 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
 
     # Infinite time NNGP/NTK.
     predict_fn_gp = predict.gp_inference(
-        k_dd if kernel_input == 'ndarray' else namedtuple('kernel', ['nngp','ntk'])(
-            {'nngp': lambda b: np.dot(k_dd.nngp, b), 'ntk': lambda b: np.dot(k_dd.ntk, b)}
-        ),
+        k_dd if kernel_input == 'ndarray' else lambda b, get: np.matmul(utils.make_2d(getattr(k_dd,get)), b),
         y_train,
         diag_reg=diag_reg,
         method=method
