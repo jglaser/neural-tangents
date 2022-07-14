@@ -31,6 +31,7 @@ from neural_tangents import predict, stax
 from neural_tangents._src.predict import _is_on_cpu
 from tests import test_utils
 
+from collections import namedtuple
 
 config.parse_flags_with_absl()
 config.update('jax_numpy_rank_promotion', 'raise')
@@ -1010,9 +1011,11 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
 
   @test_utils.product(
       do_batch=[True, False],
-      mode=['analytic', 'mc', 'empirical']
+      mode=['analytic', 'mc', 'empirical'],
+      method=['chol', 'cg'],
+      kernel_input=['ndarray','callable']
   )
-  def test_kwargs(self, do_batch, mode):
+  def test_kwargs(self, do_batch, mode, method, kernel_input):
     rng = random.PRNGKey(1)
 
     x_train = random.normal(rng, (8, 7, 10))
@@ -1077,11 +1080,17 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
     k_td = kernel_fn(x_test, x_train, **kw_td)
     k_tt = kernel_fn(x_test, None, **kw_tt)
 
+    if kernel_input == 'callable' and method != 'cg':
+        raise absltest.SkipTest(kernel_input)
+
     # Infinite time NNGP/NTK.
     predict_fn_gp = predict.gp_inference(
-        k_dd,
+        k_dd if kernel_input == 'ndarray' else namedtuple('kernel', ['nngp','ntk'])(
+            {'nngp': lambda b: np.dot(k_dd.nngp, b), 'ntk': lambda b: np.dot(k_dd.ntk, b)}
+        ),
         y_train,
-        diag_reg=diag_reg
+        diag_reg=diag_reg,
+        method=method
     )
     out_gp = predict_fn_gp(k_test_train=k_td, k_test_test=k_tt.nngp)
 
@@ -1125,7 +1134,10 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
     self.assertAllClose(out_mse, out_ensemble, atol=atol, rtol=rtol)
 
     # Finite time NNGP test.
-    predict_fn_mse = predict.gradient_descent_mse(k_dd.nngp, y_train)
+    predict_fn_mse = predict.gradient_descent_mse(
+        k_dd.nngp if kernel_input == 'ndarray' else lambda b: np.dot(k_dd.nngp,b),
+        y_train,
+        method=method)
     out_mse = predict_fn_mse(t=1.,
                              fx_train_0=None,
                              fx_test_0=0.,

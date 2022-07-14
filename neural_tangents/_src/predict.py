@@ -66,12 +66,14 @@ class PredictFn(Protocol):
 
 
 def gradient_descent_mse(
-    k_train_train: np.ndarray,
+    k_train_train: Union[np.ndarray, Callable],
     y_train: np.ndarray,
     learning_rate: float = 1.,
     diag_reg: float = 0.,
     diag_reg_absolute_scale: bool = False,
-    trace_axes: Axes = (-1,)
+    trace_axes: Axes = (-1,),
+    method = 'chol',
+    cg_kwargs = {},
 ) -> PredictFn:
   r"""Predicts the outcome of function space gradient descent training on MSE.
 
@@ -144,6 +146,13 @@ def gradient_descent_mse(
       constant-diagonal matrix. However, if you target linearized dynamics of a
       specific finite-width network, `trace_axes=()` will yield most accurate
       result.
+    method:
+      Either 'chol' (direct solve) or 'cg' (iterative solve). The direct
+      solve requires `O(N^2)` storage for the kernel matrix. The iterative
+      solve allows on-the fly evaluation of the kernel by passing a function
+      `f(b)` which multiplies it with the right hand side vector `b`.
+    cg_kwargs:
+      Extra keyword arguments passed to `jax.scipy.sparse.linalg.cg`
 
   Returns:
     A function of signature
@@ -157,10 +166,18 @@ def gradient_descent_mse(
   last_t_axes = tuple(range(-n_t_axes, 0))
   non_t_axes = tuple(range(-y_train.ndim, -n_t_axes))
 
+  if method not in ('chol', 'cg'):
+    raise ValueError('Method must to be either \'chol\' or \'cg\'')
+
   @lru_cache(1)
   def get_predict_fn_inf():
     with jax.core.eval_context():
-      solve = _get_cho_solve(k_train_train, diag_reg, diag_reg_absolute_scale)
+      if method == 'chol':
+        if callable(k_train_train):
+          raise ValueError('k_train_train must be a ndarray with method==\'chol\'')
+        solve = _get_cho_solve(k_train_train, diag_reg, diag_reg_absolute_scale)
+      elif method == 'cg':
+        solve = _get_cg_solve(k_train_train, diag_reg, diag_reg_absolute_scale, **cg_kwargs)
 
     def predict_fn_inf(fx_train_0, fx_test_0, k_test_train):
       fx_train_t = y_train.astype(k_train_train.dtype)
@@ -565,7 +582,9 @@ def gp_inference(
     y_train: np.ndarray,
     diag_reg: float = 0.,
     diag_reg_absolute_scale: bool = False,
-    trace_axes: Axes = (-1,)):
+    trace_axes: Axes = (-1,),
+    method = 'chol',
+    cg_kwargs = {}):
   r"""Compute the mean and variance of the 'posterior' of NNGP/NTK/NTKGP.
 
   NNGP - the exact posterior of an infinitely wide Bayesian NN. NTK - exact
@@ -583,8 +602,9 @@ def gp_inference(
 
   Args:
     k_train_train:
-      train-train kernel. Can be (a) :class:`jax.numpy.ndarray`,
-      (b) `Kernel` namedtuple, (c) :class:`~neural_tangents.Kernel` object.
+      train-train kernel. Can be (a) :class:`jax.numpy.ndarray`, (b) `Kernel`
+      namedtuple, (c) :class:`neural_tangents.Kernel` object, (d) `Callable`
+      that takes an argument `b, the RHS of a vector to multiply the kernel by.
       Must contain the necessary `nngp` and/or `ntk` kernels for arguments
       provided to the returned `predict_fn` function. For example, if you
       request to compute posterior test [only] NTK covariance in future
@@ -613,6 +633,14 @@ def gp_inference(
       channel / feature / logit axes indeed converges to a  constant-diagonal
       matrix. However, if you target linearized dynamics of a specific
       finite-width network, `trace_axes=()` will yield most accurate result.
+    method:
+      Either 'chol' (direct solve) or 'cg' (iterative solve). The direct
+      solve requires `O(N^2)` storage for the kernel matrix. The iterative
+      solve allows on-the fly evaluation of the kernel by passing a function
+      `f(b)` which multiplies it with the right hand side vector `b`.
+    cg_kwargs:
+      Extra keyword arguments passed to `jax.scipy.sparse.linalg.cg`
+
 
   Returns:
     A function of signature `predict_fn(get, k_test_train, k_test_test)`
@@ -622,10 +650,19 @@ def gp_inference(
   even, odd, first, last = _get_axes(_get_first(k_train_train))
   trace_axes = utils.canonicalize_axis(trace_axes, y_train)
 
+  if method not in ('chol', 'cg'):
+    raise ValueError('Method must to be either \'chol\' or \'cg\'')
+
   @lru_cache(2)
   def solve(g: str):
     k_dd = _get_attr(k_train_train, g)
-    return _get_cho_solve(k_dd, diag_reg, diag_reg_absolute_scale)
+
+    if method == 'chol':
+      if callable(k_dd):
+        raise ValueError('k_train_train must be a ndarray with method==\'chol\'')
+      return _get_cho_solve(k_dd, diag_reg, diag_reg_absolute_scale)
+    elif method == 'cg':
+      return _get_cg_solve(k_dd, diag_reg, diag_reg_absolute_scale, **cg_kwargs)
 
   @lru_cache(2)
   def k_inv_y(g: str):
@@ -1213,9 +1250,17 @@ def _get_fns_in_eigenbasis(
   return (to_eigenbasis(fn) for fn in fns)
 
 
-def _add_diagonal_regularizer(A: np.ndarray,
+def _add_diagonal_regularizer(A: Union[np.ndarray, Callable],
                               diag_reg: float,
                               diag_reg_absolute_scale: bool) -> np.ndarray:
+  if callable(A):
+    if not diag_reg_absolute_scale:
+      raise NotImplementedError
+
+    def A_regularized(b):
+      return A(b) + diag_reg * b
+    return A_regularized
+
   dimension = A.shape[0]
   if not diag_reg_absolute_scale:
     diag_reg *= np.trace(A) / dimension
@@ -1245,6 +1290,28 @@ def _get_cho_solve(A: np.ndarray,
     return x
 
   return cho_solve
+
+def _get_cg_solve(A: Union[np.ndarray, Callable],
+                  diag_reg: float,
+                  diag_reg_absolute_scale: bool,
+                  **kwargs) -> Callable[[Union[np.ndarray, Callable], Axes],
+                                               np.ndarray]:
+
+  A = _add_diagonal_regularizer(A, diag_reg, diag_reg_absolute_scale)
+
+  def cg_solve(b: Union[np.ndarray, Callable], b_axes: Axes) -> np.ndarray:
+    b_axes = utils.canonicalize_axis(b_axes, b)
+    last_b_axes = range(-len(b_axes), 0)
+
+    b = np.moveaxis(b, b_axes, last_b_axes)
+    x_shape = b.shape
+    b = b.reshape((b.shape[0], -1))
+
+    x, convergence_info = sp.sparse.linalg.cg(A, b, **kwargs)
+    x = x.reshape(x_shape)
+    return x
+
+  return cg_solve
 
 
 def _get_fx_test_shape(y_train: np.ndarray,
