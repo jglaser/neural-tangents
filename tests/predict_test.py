@@ -14,23 +14,21 @@
 
 """Tests for `neural_tangents/predict.py`."""
 
-
 import math
 
 from absl.testing import absltest
-from absl.testing import parameterized
 from jax import grad
 from jax import jit
-from jax import test_util as jtu
+from jax import random
 from jax import vmap
 from jax.config import config
 from jax.example_libraries import optimizers
 from jax.flatten_util import ravel_pytree
 import jax.numpy as np
-import jax.random as random
 import jax.tree_util
 import neural_tangents as nt
 from neural_tangents import predict, stax
+from neural_tangents._src.predict import _is_on_cpu
 from tests import test_utils
 
 
@@ -38,8 +36,7 @@ config.parse_flags_with_absl()
 config.update('jax_numpy_rank_promotion', 'raise')
 
 
-MATRIX_SHAPES = [(3, 3), (4, 4)]
-OUTPUT_LOGITS = [1, 2]
+OUTPUT_LOGITS = [2]
 
 GETS = ('ntk', 'nngp', ('ntk', 'nngp'))
 
@@ -55,9 +52,10 @@ POOLING = 'POOLING'
 
 # TODO(schsam): Add a pooling test when multiple inputs are supported in
 # Conv + Pooling.
-TRAIN_SHAPES = [(4, 8), (8, 8), (6, 4, 4, 3)]
-TEST_SHAPES = [(6, 8), (16, 8), (2, 4, 4, 3)]
-NETWORK = [FLAT, FLAT, FLAT, FLAT]
+TRAIN_SIZES = [4, 8]
+TEST_SIZES = [6, 2]
+INPUT_SHAPES = [(8,), (4, 4, 3)]
+NETWORK = [FLAT, FLAT]
 
 CONVOLUTION_CHANNELS = 256
 
@@ -90,13 +88,13 @@ def _empirical_kernel(key, input_shape, network, out_logits):
   _, params = init_fn(key, (-1,) + input_shape)
   _kernel_fn = nt.empirical_kernel_fn(f, trace_axes=(), vmap_axes=0)
   kernel_fn = lambda x1, x2, get: _kernel_fn(x1, x2, get, params)
-  return params, f, jit(kernel_fn, static_argnums=(2,))
+  return params, f, jit(kernel_fn, static_argnames='get')
 
 
 def _theoretical_kernel(key, input_shape, network, out_logits):
   init_fn, f, kernel_fn = _build_network(input_shape, network, out_logits)
   _, params = init_fn(key, (-1,) + input_shape)
-  return params, f, jit(kernel_fn, static_argnums=(2,))
+  return params, f, jit(kernel_fn, static_argnames='get')
 
 
 KERNELS = {
@@ -106,13 +104,6 @@ KERNELS = {
 
 
 class PredictTest(test_utils.NeuralTangentsTestCase):
-
-  def _assertAllClose(self, x, y, rtol):
-    x = ravel_pytree(x)[0]
-    y = ravel_pytree(y)[0]
-    diff = 2 * np.sum(np.abs(x - y)) / (np.sum(np.abs(x))
-                                        + np.sum(np.abs(y)) + 1e-4)
-    self.assertLess(diff, rtol)
 
   def _test_zero_time(self, predictor, fx_train_0, fx_test_0, g_td, momentum):
     fx_train_t0, fx_test_t0 = predictor(0.0, fx_train_0, fx_test_0, g_td)
@@ -185,46 +176,37 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
     x_test = random.normal(split, test_shape)
     return key, x_test, x_train, y_train
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}_{}_'
-              'momentum={}_lr={}_loss={}_t={}'.format(train, test, network,
-                                                      out_logits, name,
-                                                      momentum, learning_rate,
-                                                      loss, t),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-          'fn_and_kernel':
-              fn,
-          'momentum':
-              momentum,
-          'loss':
-              loss,
-          'learning_rate':
-              learning_rate,
-          't':
-              t
-      } for train, test, network in
-                          zip(TRAIN_SHAPES, TEST_SHAPES, NETWORK)
-                          for out_logits in OUTPUT_LOGITS
-                          for name, fn in KERNELS.items()
-                          for momentum in [None, 0.9]
-                          for learning_rate in [0.0002]
-                          for t in [5]
-                          for loss in ['mse_analytic', 'mse'])
+  @test_utils.product(
+      train_size=TRAIN_SIZES,
+      test_size=TEST_SIZES,
+      input_shape=INPUT_SHAPES,
+      network=NETWORK,
+      out_logits=OUTPUT_LOGITS,
+      kernel_type=list(KERNELS.keys()),
+      momentum=[None, 0.9],
+      learning_rate=[0.0002],
+      t=[5],
+      loss=['mse_analytic', 'mse'],
   )
-  def testNTKGDPrediction(self, train_shape, test_shape, network, out_logits,
-                          fn_and_kernel, momentum, learning_rate, t, loss):
+  def testNTKGDPrediction(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+      kernel_type,
+      momentum,
+      learning_rate,
+      t,
+      loss
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     key, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                      train_shape)
 
+    fn_and_kernel = KERNELS[kernel_type]
     params, f, ntk = fn_and_kernel(key, train_shape[1:], network, out_logits)
 
     g_dd = ntk(x_train, None, 'ntk')
@@ -283,25 +265,21 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
     return np.einsum('itjk,itlk->tjl', x, x, optimize=True) / (x.shape[0] *
                                                                x.shape[-1])
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:1], TEST_SHAPES[:1], NETWORK[:1])
-                          for out_logits in [1]))
-  def testNTKMeanCovPrediction(self, train_shape, test_shape, network,
-                               out_logits):
+  @test_utils.product(
+      train_size=TRAIN_SIZES[:1],
+      test_size=TEST_SIZES[:1],
+      input_shape=INPUT_SHAPES[:1],
+      out_logits=[1],
+  )
+  def testNTKMeanCovPrediction(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      out_logits,
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     key, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                      train_shape)
     init_fn, f, kernel_fn = stax.serial(
@@ -348,31 +326,35 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
       return fx_train_mean, fx_test_mean, cov_train, cov_test
 
     fx_train_mc, fx_test_mc, cov_train_mc, cov_test_mc = predict_mc(4096, key)
-    rtol = 0.05
-    self._assertAllClose(fx_train_mc, fx_train_inf, rtol)
-    self._assertAllClose(cov_train_mc, cov_train_inf, rtol)
-    self._assertAllClose(cov_test_mc, cov_test_inf, rtol)
-    self._assertAllClose(fx_test_mc, fx_test_inf, rtol)
+    tol = 0.05
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:-1], TEST_SHAPES[:-1], NETWORK[:-1])
-                          for out_logits in OUTPUT_LOGITS))
-  def testGradientDescentMseEnsembleGet(self, train_shape, test_shape, network,
-                                        out_logits):
+    assert_close = lambda a, b: self.assertAllClose(ravel_pytree(a)[0],
+                                                    ravel_pytree(b)[0],
+                                                    atol=tol,
+                                                    rtol=tol)
+
+    assert_close(fx_train_mc, fx_train_inf)
+    assert_close(cov_train_mc, cov_train_inf)
+    assert_close(cov_test_mc, cov_test_inf)
+    assert_close(fx_test_mc, fx_test_inf)
+
+  @test_utils.product(
+      train_size=TRAIN_SIZES[:-1],
+      test_size=TEST_SIZES[:-1],
+      input_shape=INPUT_SHAPES,
+      network=NETWORK[:-1],
+      out_logits=OUTPUT_LOGITS,
+  )
+  def testGradientDescentMseEnsembleGet(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     _, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                    train_shape)
     _, _, kernel_fn = _build_network(train_shape[1:], network, out_logits)
@@ -401,27 +383,25 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
         self.assertAllClose(out[0], out2[1])
         self.assertAllClose(out[1], out2[0])
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}_get={}'.format(
-                  train, test, network, out_logits, get),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-          'get':
-              get,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:-1], TEST_SHAPES[:-1], NETWORK[:-1])
-                          for out_logits in OUTPUT_LOGITS for get in GETS))
-  def testInfiniteTimeAgreement(self, train_shape, test_shape, network,
-                                out_logits, get):
+  @test_utils.product(
+      train_size=TRAIN_SIZES[:-1],
+      test_size=TEST_SIZES[:-1],
+      input_shape=INPUT_SHAPES[:-1],
+      network=NETWORK[:-1],
+      out_logits=OUTPUT_LOGITS,
+      get=GETS
+  )
+  def testInfiniteTimeAgreement(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+      get
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     _, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                    train_shape)
     _, _, kernel_fn = _build_network(train_shape[1:], network, out_logits)
@@ -444,25 +424,24 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
           self.assertAllClose(inf, inf_x)
           self.assertAllClose(inf_x, fin_x)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:-1], TEST_SHAPES[:-1], NETWORK[:-1])
-                          for out_logits in OUTPUT_LOGITS))
-  def testZeroTimeAgreement(self, train_shape, test_shape, network, out_logits):
+  @test_utils.product(
+      train_size=TRAIN_SIZES,
+      test_size=TEST_SIZES,
+      input_shape=INPUT_SHAPES,
+      network=NETWORK,
+      out_logits=OUTPUT_LOGITS,
+  )
+  def testZeroTimeAgreement(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+  ):
     """Test that the NTK and NNGP agree at t=0."""
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     _, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                    train_shape)
     _, _, ker_fun = _build_network(train_shape[1:], network, out_logits)
@@ -501,25 +480,23 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
         return out._replace(nngp=out.ntk)
     return always_ntk
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:-1], TEST_SHAPES[:-1], NETWORK[:-1])
-                          for out_logits in OUTPUT_LOGITS))
-  def testNTK_NTKNNGPAgreement(self, train_shape, test_shape, network,
-                               out_logits):
+  @test_utils.product(
+      train_size=TRAIN_SIZES,
+      test_size=TEST_SIZES,
+      input_shape=INPUT_SHAPES,
+      network=NETWORK,
+      out_logits=OUTPUT_LOGITS,
+  )
+  def testNTK_NTKNNGPAgreement(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     _, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                    train_shape)
     _, _, ker_fun = _build_network(train_shape[1:], network, out_logits)
@@ -596,24 +573,23 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
           # Although, due to accumulation of numerical errors, only roughly.
           self.assertAllClose(nngp_cov, nngp_ntk_cov)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:-1], TEST_SHAPES[:-1], NETWORK[:-1])
-                          for out_logits in OUTPUT_LOGITS))
-  def testPredCovPosDef(self, train_shape, test_shape, network, out_logits):
+  @test_utils.product(
+      train_size=TRAIN_SIZES,
+      test_size=TEST_SIZES,
+      input_shape=INPUT_SHAPES,
+      network=NETWORK,
+      out_logits=OUTPUT_LOGITS,
+  )
+  def testPredCovPosDef(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      network,
+      out_logits,
+  ):
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
     _, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                    train_shape)
     _, _, ker_fun = _build_network(train_shape[1:], network, out_logits)
@@ -634,25 +610,19 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
             self.assertAllClose(cov, np.moveaxis(cov, -1, -2))
             self.assertGreater(np.min(np.linalg.eigh(cov)[0]), -1e-4)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_train={}_test={}_network={}_logits={}'.format(
-                  train, test, network, out_logits),
-          'train_shape':
-              train,
-          'test_shape':
-              test,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-      }
-                          for train, test, network in zip(
-                              TRAIN_SHAPES[:1], TEST_SHAPES[:1], NETWORK[:1])
-                          for out_logits in [1]))
-  def testTrainedEnsemblePredCov(self, train_shape, test_shape, network,
-                                 out_logits):
+  @test_utils.product(
+      train_size=TRAIN_SIZES[:1],
+      test_size=TEST_SIZES[:1],
+      input_shape=INPUT_SHAPES[:1],
+      out_logits=[1],
+  )
+  def testTrainedEnsemblePredCov(
+      self,
+      train_size,
+      test_size,
+      input_shape,
+      out_logits
+  ):
     training_steps = 1000
     learning_rate = 0.1
     ensemble_size = 1024
@@ -663,6 +633,9 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
 
     opt_init, opt_update, get_params = optimizers.sgd(learning_rate)
     opt_update = jit(opt_update)
+
+    train_shape = (train_size, *input_shape)
+    test_shape = (test_size, *input_shape)
 
     key, x_test, x_train, y_train = self._get_inputs(out_logits, test_shape,
                                                      train_shape)
@@ -688,7 +661,7 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
       return get_params(opt_state)
 
     params = vmap(train_network)(ensemble_key)
-    rtol = 0.08
+    tol = 0.08
 
     for x in [None, 'x_test']:
       with self.subTest(x=x):
@@ -703,8 +676,9 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
                 mean_subtracted.shape[0] * mean_subtracted.shape[-1])
 
         ntk = predict_fn_mse_ens(training_steps, x, 'ntk', compute_cov=True)
-        self._assertAllClose(mean_emp, ntk.mean, rtol)
-        self._assertAllClose(cov_emp, ntk.covariance, rtol)
+        self.assertAllClose(ravel_pytree(mean_emp)[0],
+                            ravel_pytree(ntk.mean)[0], rtol=tol, atol=tol)
+        self.assertAllClose(cov_emp, ntk.covariance, rtol=tol, atol=tol)
 
   def testGradientDescentMseEnsembleTrain(self):
     key = random.PRNGKey(1)
@@ -720,7 +694,7 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
       with self.subTest(t=t):
         y_none = predictor(t, None, None, compute_cov=True)
         y_x = predictor(t, x, None, compute_cov=True)
-        self._assertAllClose(y_none, y_x, 0.04)
+        self.assertAllClose(y_none, y_x, rtol=0.04, atol=0.04)
 
   def testGpInference(self):
     reg = 1e-5
@@ -768,7 +742,8 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
 
               out_ens = gd_ensemble(None, x_test, get, compute_cov)
               out_ens_inf = gd_ensemble(np.inf, x_test, get, compute_cov)
-              self._assertAllClose(out_ens_inf, out_ens, 0.08)
+              tol = 0.35 if jax.default_backend() == 'tpu' else 0.08
+              self.assertAllClose(out_ens_inf, out_ens, rtol=tol, atol=tol)
 
               if (get is not None and
                   'nngp' not in get and
@@ -919,8 +894,7 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
 
             kernel_fn = nt.empirical_kernel_fn(apply_fn, trace_axes=trace_axes)
 
-            # TODO(romann): investigate the SIGTERM error on CPU.
-            # kernel_fn = jit(kernel_fn, static_argnums=(2,))
+            kernel_fn = jit(kernel_fn, static_argnames='get')
             ntk_train_train = kernel_fn(x_train, None, 'ntk', params)
             if x is not None:
               ntk_test_train = kernel_fn(x, x_train, 'ntk', params)
@@ -961,36 +935,31 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
                 self.assertAllClose(y_test_shape, p_test.shape)
               self.assertAllClose(y_train_shape, p_train.shape)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_train={train}_network={network}_logits={out_logits}_{name}' +
-              f'_lr_factor={lr_factor}_momentum={momentum}',
-          'train_shape':
-              train,
-          'network':
-              network,
-          'out_logits':
-              out_logits,
-          'fn_and_kernel':
-              fn,
-          'lr_factor':
-              lr_factor,
-          'momentum':
-              momentum,
-      } for train, network in zip(TRAIN_SHAPES, NETWORK)
-                          for out_logits in OUTPUT_LOGITS
-                          for name, fn in KERNELS.items()
-                          for lr_factor in [0.5, 1., 3.]
-                          for momentum in [0., 0.1, 0.5, 0.9]))
-  def testMaxLearningRate(self, train_shape, network, out_logits,
-                          fn_and_kernel, lr_factor, momentum):
+  @test_utils.product(
+      train_size=TRAIN_SIZES,
+      input_shape=INPUT_SHAPES,
+      network=NETWORK,
+      out_logits=OUTPUT_LOGITS,
+      kernel_type=list(KERNELS.keys()),
+      lr_factor=[0.5, 1., 3.],
+      momentum=[0., 0.1, 0.5, 0.9]
+  )
+  def testMaxLearningRate(
+      self,
+      train_size,
+      input_shape,
+      network,
+      out_logits,
+      kernel_type,
+      lr_factor,
+      momentum
+  ):
 
     key = random.PRNGKey(0)
 
     key, split = random.split(key)
-    if len(train_shape) == 2:
-      train_shape = (train_shape[0] * 5, train_shape[1] * 10)
+    if len(input_shape) == 1:
+      train_shape = (train_size * 5, input_shape[0] * 10)
     else:
       train_shape = (16, 8, 8, 3)
     x_train = random.normal(split, train_shape)
@@ -1008,6 +977,7 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
 
     steps = 30
 
+    fn_and_kernel = KERNELS[kernel_type]
     params, f, ntk = fn_and_kernel(key, train_shape[1:], network, out_logits)
     g_dd = ntk(x_train, None, 'ntk')
 
@@ -1038,14 +1008,10 @@ class PredictTest(test_utils.NeuralTangentsTestCase):
 
 class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name': f'batch={do_batch}_mode={mode}',
-          'do_batch': do_batch,
-          'mode': mode
-      }
-                          for do_batch in [True, False]
-                          for mode in ['analytic', 'mc', 'empirical']))
+  @test_utils.product(
+      do_batch=[True, False],
+      mode=['analytic', 'mc', 'empirical']
+  )
   def test_kwargs(self, do_batch, mode):
     rng = random.PRNGKey(1)
 
@@ -1058,14 +1024,13 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
     pattern_train = random.normal(rng, (8, 7, 7))
     pattern_test = random.normal(rng, (4, 7, 7))
 
+    diag_reg = 1e-4
+
     if jax.default_backend() == 'tpu':
-      # TODO(romann): figure out why TPU accuracy is so low.
-      diag_reg = 1e-2
       atol = 3e-3
-      rtol = 0.4
-      width = 512
+      rtol = 4e-2
+      width = 256
     else:
-      diag_reg = 1e-4
       atol = 5e-4
       rtol = 1e-2
       width = 64
@@ -1183,6 +1148,40 @@ class PredictKwargsTest(test_utils.NeuralTangentsTestCase):
                                        compute_cov=False,
                                        **kw_dd)
     self.assertAllClose(out_mse, out_ensemble, atol=atol, rtol=rtol)
+
+
+class IsOnCpuTest(test_utils.NeuralTangentsTestCase):
+
+  def test_is_on_cpu(self):
+    dtypes = [np.float16, np.float32]
+    float64 = jax.dtypes.canonicalize_dtype(np.float64)
+    if float64 != np.float32:
+      dtypes += [float64]
+
+    for dtype in dtypes:
+      with self.subTest(dtype=dtype):
+
+        def x():
+          return random.normal(random.PRNGKey(1), (2, 3), dtype)
+
+        def x_cpu():
+          return jax.device_get(random.normal(random.PRNGKey(1), (2, 3), dtype))
+
+        x_jit = jit(x)
+        # x_cpu_jit = jit(x_cpu)
+        x_cpu_jit_cpu = jit(x_cpu, backend='cpu')
+
+        self.assertTrue(_is_on_cpu(x_cpu()))
+        # TODO(mattjj): re-enable this when device_put under jit works
+        # self.assertTrue(predict._is_on_cpu(x_cpu_jit()))
+        self.assertTrue(_is_on_cpu(x_cpu_jit_cpu()))
+
+        if jax.default_backend() == 'cpu':
+          self.assertTrue(_is_on_cpu(x()))
+          self.assertTrue(_is_on_cpu(x_jit()))
+        else:
+          self.assertFalse(_is_on_cpu(x()))
+          self.assertFalse(_is_on_cpu(x_jit()))
 
 
 if __name__ == '__main__':

@@ -1,6 +1,8 @@
-.. default-role:: code
+:github_url: https://github.com/google/neural-tangents/tree/main/docs/empirical.rst
 
-Empirical -- finite NNGP and NTK
+
+
+`nt.empirical` -- finite NNGP and NTK
 ======================================
 
 .. automodule:: neural_tangents._src.empirical
@@ -17,6 +19,11 @@ Finite-width NNGP and/or NTK kernel functions.
     empirical_nngp_fn
     empirical_ntk_fn
 
+NTK implementation
+--------------------------------------
+An :class:`enum.IntEnum` specifying NTK implementation method.
+
+.. autoclass:: NtkImplementation
 
 Linearization and Taylor expansion
 --------------------------------------

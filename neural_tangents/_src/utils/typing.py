@@ -16,37 +16,24 @@
 
 from typing import Any, Dict, Generator, List, Optional, Sequence, TYPE_CHECKING, Tuple, TypeVar, Union
 
-import jax.numpy as np
 from jax import random
+import jax.numpy as np
 from .kernel import Kernel
 from typing_extensions import Protocol
 
 
-"""A type alias for PyTrees.
-
-  See https://jax.readthedocs.io/en/latest/pytrees.html
-  for details.
-"""
 PyTree = Any
+"""A PyTree, see `JAX docs`_ for details.
 
-
-"""A type alias for axes specification.
-
-  Axes can be specified as integers (`axis=-1`) or sequences (`axis=(1, 3)`).
+.. _JAX docs: https://jax.readthedocs.io/en/latest/pytrees.html
 """
+
+
 Axes = Union[int, Sequence[int]]
-
-
-"""Neural Tangents Trees.
-
-Trees of kernels and arrays naturally emerge in certain neural
-network computations (for example, when neural networks have nested parallel
-layers).
-
-Mimicking JAX, we use a lightweight tree structure called an NTTree. NTTrees
-have internal nodes that are either Lists or Tuples and leaves which are either
-array or kernel objects.
+"""Axes specification, can be integers (`axis=-1`) or sequences (`axis=(1, 3)`).
 """
+
+
 T = TypeVar('T')
 
 if TYPE_CHECKING:
@@ -55,10 +42,26 @@ if TYPE_CHECKING:
 else:
   # Can't use recursive types with `sphinx-autodoc-typehints`.
   NTTree = Union[List[T], Tuple[T, ...], T]
+  """Neural Tangents Tree.
+
+  Trees of kernels and arrays naturally emerge in certain neural
+  network computations (for example, when neural networks have nested parallel
+  layers).
+
+  Mimicking JAX, we use a lightweight tree structure called an :class:`NTTree`.
+  :class:`NTTree` has internal nodes that are either lists or tuples and leaves
+  which are either :class:`jax.numpy.ndarray` or
+  :class:`~neural_tangents.Kernel` objects.
+  """
+
   NTTrees = Union[List[T], Tuple[T, ...]]
+  """A list or tuple of :class:`NTTree` s.
+  """
 
 
 Shapes = NTTree[Tuple[int, ...]]
+"""A shape - a tuple of integers, or an :class:`NTTree` of such tuples.
+"""
 
 
 # Layer Definition.
@@ -137,10 +140,11 @@ class LayerKernelFn(Protocol):
 class AnalyticKernelFn(Protocol):
   """A type alias for analytic kernel functions.
 
-  A kernel function that computes an analytic kernel. Takes either a `Kernel`
-  or `np.ndarray` inputs and a `get` argument that specifies what quantities
-  should be computed by the kernel. Returns either a `Kernel` object or
-  `np.ndarray`s for kernels specified by `get`.
+  A kernel function that computes an analytic kernel. Takes either a
+  :class:`~neural_tangents.Kernel` or :class:`jax.numpy.ndarray` inputs and a
+  `get` argument that specifies what quantities should be computed by the
+  kernel. Returns either a :class:`~neural_tangents.Kernel` object or
+  :class:`jax.numpy.ndarray`-s for kernels specified by `get`.
   """
 
   def __call__(
@@ -225,13 +229,16 @@ InternalLayerMasked = Tuple[InitFn, ApplyFn, LayerKernelFn, MaskFn]
 Layer = Tuple[InitFn, ApplyFn, AnalyticKernelFn]
 
 
-"""A type alias for kernel inputs/outputs of `FanOut`, `FanInSum`, etc.
-"""
 Kernels = Union[List[Kernel], Tuple[Kernel, ...]]
-
-
-"""Specifies `(input, output, kwargs)` axes for `vmap` in empirical NTK.
+"""Kernel inputs/outputs of `FanOut`, `FanInSum`, etc.
 """
-_VMapAxis = Optional[NTTree[int]]
+
+
+_VMapAxis = Optional[PyTree]
+"""A `PyTree` of integers.
+"""
+
 VMapAxisTriple = Tuple[_VMapAxis, _VMapAxis, Dict[str, _VMapAxis]]
 VMapAxes = Union[_VMapAxis, VMapAxisTriple]
+"""Specifies `(input, output, kwargs)` axes for `vmap` in empirical NTK.
+"""

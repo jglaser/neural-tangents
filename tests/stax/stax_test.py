@@ -14,23 +14,21 @@
 
 """Tests for `neural_tangents/stax.py`."""
 
-
 import functools
 import itertools
 import random as prandom
 from typing import Tuple
 
 from absl.testing import absltest
-from absl.testing import parameterized
 from jax import default_backend
 from jax import jit
-from jax import test_util as jtu
+from jax import random
 from jax.config import config
 from jax.example_libraries import stax as ostax
 import jax.numpy as np
-import jax.random as random
 import neural_tangents as nt
 from neural_tangents import stax
+from neural_tangents._src.empirical import _DEFAULT_TESTING_NTK_IMPLEMENTATION
 from tests import test_utils
 import numpy as onp
 
@@ -72,9 +70,7 @@ STRIDES = [
     (2, 1),
 ]
 
-ACTIVATIONS = {
-    stax.Relu(): 'Relu',
-}
+ACTIVATIONS = [stax.Relu()]
 
 PROJECTIONS = [
     'FLAT',
@@ -82,24 +78,6 @@ PROJECTIONS = [
     'ATTN',
 ]
 
-LAYER_NORM = [
-    'C',
-    'HC',
-    'CHW',
-    'NC',
-    'NWC',
-    'NCHW'
-]
-
-POOL_TYPES = [
-    'SUM',
-    'AVG'
-]
-
-PARAMETERIZATIONS = [
-    'NTK',
-    'STANDARD'
-]
 
 test_utils.update_test_tolerance()
 
@@ -122,7 +100,7 @@ def _get_inputs(
 
 def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
              phi, strides, width, is_ntk, proj_into_2d, pool_type, layer_norm,
-             parameterization, use_dropout):
+             parameterization, s, use_dropout):
 
   if is_conv:
     # Select a random filter order.
@@ -168,17 +146,18 @@ def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
   if layer_norm:
     layer_norm = tuple(spec.index(c) for c in layer_norm)
 
-  def fc(out_dim):
+  def fc(out_dim, s):
     return stax.Dense(
         out_dim=out_dim,
         W_std=W_std,
         b_std=b_std,
         parameterization=parameterization,
+        s=s,
         batch_axis=batch_axis_fc,
         channel_axis=channel_axis_fc
     )
 
-  def conv(out_chan):
+  def conv(out_chan, s):
     return stax.Conv(
         out_chan=out_chan,
         filter_shape=filter_shape,
@@ -187,10 +166,12 @@ def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
         W_std=W_std,
         b_std=b_std,
         dimension_numbers=dimension_numbers,
-        parameterization=parameterization
+        parameterization=parameterization,
+        s=s
     )
 
-  affine = conv(width) if is_conv else fc(width)
+  affine = conv(width, (s, s)) if is_conv else fc(width, (s, s))
+  affine_bottom = conv(width, (1, s)) if is_conv else fc(width, (1, s))
 
   rate = onp.random.uniform(0.5, 0.9)
   dropout = stax.Dropout(rate, mode='train')
@@ -220,7 +201,7 @@ def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
   res_unit = stax.serial(dropout_or_identity, affine, pool_or_identity)
   if is_res:
     block = stax.serial(
-        affine,
+        affine_bottom,
         stax.FanOut(2),
         stax.parallel(stax.Identity(),
                       res_unit),
@@ -229,7 +210,7 @@ def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
         phi)
   else:
     block = stax.serial(
-        affine,
+        affine_bottom,
         res_unit,
         layer_norm_or_identity,
         phi)
@@ -258,11 +239,14 @@ def _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res, padding,
         stax.Flatten(batch_axis, batch_axis_fc))
   else:
     raise ValueError(proj_into_2d)
-  readout = stax.serial(proj_layer, fc(1 if is_ntk else width))
+
+  readout = stax.serial(proj_layer,
+                        fc(1 if is_ntk else width, (s, 1 if is_ntk else s)))
 
   device_count = -1 if spec.index('N') == 0 else 0
 
-  return stax.serial(block, readout), input_shape, device_count, channel_axis_fc
+  net = stax.serial(block, readout)
+  return net, input_shape, device_count, channel_axis_fc
 
 
 def _get_net_pool(width, is_ntk, pool_type, padding,
@@ -310,6 +294,61 @@ def _get_net_pool(width, is_ntk, pool_type, padding,
   ), INPUT_SHAPE, device_count, -1
 
 
+def _check_agreement_with_empirical(
+    self,
+    net,
+    same_inputs,
+    use_dropout,
+    is_ntk,
+    rtol=RTOL,
+    atol=ATOL
+):
+  ((init_fn, apply_fn, kernel_fn),
+   input_shape, device_count, channel_axis) = net
+
+  num_samples = N_SAMPLES * 5 if use_dropout else N_SAMPLES
+  key = random.PRNGKey(1)
+  x1, x2 = _get_inputs(key, same_inputs, input_shape)
+  if default_backend() == 'tpu' and use_dropout:
+    # including a test case for tpu + dropout with (parallel + batching)
+    batch_size = 2
+  else:
+    batch_size = 0
+  x1_out_shape, params = init_fn(key, x1.shape)
+  if same_inputs:
+    assert x2 is None
+  if x2 is None:
+    x2_out_shape = x1_out_shape
+  else:
+    x2_out_shape, params = init_fn(key, x2.shape)
+  del params
+
+  def _get_empirical(n_samples, get):
+    kernel_fn_empirical = nt.monte_carlo_kernel_fn(
+        init_fn=init_fn,
+        apply_fn=apply_fn,
+        key=key,
+        n_samples=n_samples,
+        device_count=device_count,
+        trace_axes=(channel_axis,),
+        batch_size=batch_size,
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION
+    )
+    if same_inputs:
+      assert x2 is None
+    return kernel_fn_empirical(x1, x2, get)
+
+  if is_ntk:
+    exact, shape1, shape2 = kernel_fn(x1, x2, ('ntk', 'shape1', 'shape2'))
+    empirical = _get_empirical(num_samples, 'ntk')
+  else:
+    exact, shape1, shape2 = kernel_fn(x1, x2, ('nngp', 'shape1', 'shape2'))
+    empirical = _get_empirical(num_samples, 'nngp')
+  test_utils.assert_close_matrices(self, exact, empirical, rtol, atol)
+  self.assertEqual(shape1, x1_out_shape)
+  self.assertEqual(shape2, x2_out_shape)
+
+
 class StaxTest(test_utils.NeuralTangentsTestCase):
 
   def _skip_test(self, filter_shape, is_conv, is_res, padding, proj_into_2d,
@@ -327,51 +366,33 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
           use_pooling):
       raise absltest.SkipTest('FC models do not have these parameters.')
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(
-                  model, phi_name, width, 'same_inputs'
-                  if same_inputs else 'different_inputs', 'filter_shape=%s' %
-                  str(filter_shape), 'padding=%s' % padding, 'strides=%s' %
-                  str(strides), 'pool' if use_pooling else 'flatten',
-                  'NTK' if is_ntk else 'NNGP', 'RESNET' if is_res else 'serial',
-                  proj_into_2d),
-          'model':
-              model,
-          'width':
-              width,
-          'strides':
-              strides,
-          'padding':
-              padding,
-          'phi':
-              phi,
-          'same_inputs':
-              same_inputs,
-          'filter_shape':
-              filter_shape,
-          'use_pooling':
-              use_pooling,
-          'is_ntk':
-              is_ntk,
-          'is_res':
-              is_res,
-          'proj_into_2d':
-              proj_into_2d
-      }
-                          for model in MODELS
-                          for width in WIDTHS
-                          for phi, phi_name in ACTIVATIONS.items()
-                          for same_inputs in [False]
-                          for padding in PADDINGS for strides in STRIDES
-                          for filter_shape in FILTER_SHAPES
-                          for use_pooling in [False, True]
-                          for is_ntk in [False, True]
-                          for is_res in [False, True]
-                          for proj_into_2d in PROJECTIONS))
-  def test_exact(self, model, width, strides, padding, phi, same_inputs,
-                 filter_shape, use_pooling, is_ntk, is_res, proj_into_2d):
+  @test_utils.product(
+      model=MODELS,
+      width=WIDTHS,
+      phi=ACTIVATIONS,
+      same_inputs=[False],
+      padding=PADDINGS,
+      strides=STRIDES,
+      filter_shape=FILTER_SHAPES,
+      use_pooling=[False, True],
+      is_ntk=[False, True],
+      is_res=[False, True],
+      proj_into_2d=PROJECTIONS,
+  )
+  def test_exact(
+      self,
+      model,
+      width,
+      strides,
+      padding,
+      phi,
+      same_inputs,
+      filter_shape,
+      use_pooling,
+      is_ntk,
+      is_res,
+      proj_into_2d
+  ):
     is_conv = 'conv' in model
 
     # Check for duplicate / incorrectly-shaped NN configs / wrong backend.
@@ -386,139 +407,34 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
 
     net = _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res,
                    padding, phi, strides, width, is_ntk, proj_into_2d,
-                   pool_type, layer_norm, parameterization, use_dropout)
-    self._check_agreement_with_empirical(
-        net, same_inputs, use_dropout, is_ntk, RTOL, 1.05)
+                   pool_type, layer_norm, parameterization, 1, use_dropout)
+    _check_agreement_with_empirical(
+        self, net, same_inputs, use_dropout, is_ntk, RTOL, 1.2)
 
-  # pylint: disable=g-complex-comprehension
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_model={model}'
-              f'_width={width}'
-              f'_same_inputs={same_inputs}'
-              f'_filter_shape={filter_shape}'
-              f'_proj={proj_into_2d}_'
-              f'_is_ntk={is_ntk}_'
-              f'_b_std={b_std}_'
-              f'_param={parameterization}',
-          'model':
-              model,
-          'width':
-              width,
-          'same_inputs':
-              same_inputs,
-          'filter_shape':
-              filter_shape,
-          'proj_into_2d':
-              proj_into_2d,
-          'is_ntk':
-              is_ntk,
-          'b_std':
-              b_std,
-          'parameterization':
-              parameterization
-      }
-                          for model in MODELS
-                          for width in WIDTHS
-                          for same_inputs in [False]
-                          for is_ntk in [False, True]
-                          for filter_shape in FILTER_SHAPES
-                          for proj_into_2d in PROJECTIONS[:2]
-                          for b_std in [None, 0., 0.5**0.5]
-                          for parameterization in PARAMETERIZATIONS))
-  def test_parameterizations(
+  @test_utils.product(
+      model=MODELS,
+      width=WIDTHS,
+      same_inputs=[False],
+      is_ntk=[False, True],
+      proj_into_2d=PROJECTIONS[:2],
+      layer_norm=[
+          'C',
+          'HC',
+          'CHW',
+          'NC',
+          'NWC',
+          'NCHW'
+      ],
+  )
+  def test_layernorm(
       self,
       model,
       width,
       same_inputs,
       is_ntk,
-      filter_shape,
       proj_into_2d,
-      b_std,
-      parameterization
+      layer_norm
   ):
-    is_conv = 'conv' in model
-
-    W_std = 2.**0.5
-    if parameterization == 'STANDARD':
-      W_std /= width**0.5
-      if b_std is not None:
-        b_std /= width**0.5
-
-    padding = PADDINGS[0]
-    strides = STRIDES[0]
-    phi = stax.Relu()
-    use_pooling, is_res = False, False
-    layer_norm = None
-    pool_type = 'AVG'
-    use_dropout = False
-
-    # Check for duplicate / incorrectly-shaped NN configs / wrong backend.
-    if is_conv:
-      test_utils.skip_test(self)
-    elif proj_into_2d != PROJECTIONS[0] or filter_shape != FILTER_SHAPES[0]:
-      raise absltest.SkipTest('FC models do not have these parameters.')
-
-    net = _get_net(W_std=W_std,
-                   b_std=b_std,
-                   filter_shape=filter_shape,
-                   is_conv=is_conv,
-                   use_pooling=use_pooling,
-                   is_res=is_res,
-                   padding=padding,
-                   phi=phi,
-                   strides=strides,
-                   width=width,
-                   is_ntk=is_ntk,
-                   proj_into_2d=proj_into_2d,
-                   pool_type=pool_type,
-                   layer_norm=layer_norm,
-                   parameterization=parameterization,
-                   use_dropout=use_dropout)
-    self._check_agreement_with_empirical(net=net,
-                                         same_inputs=same_inputs,
-                                         use_dropout=use_dropout,
-                                         is_ntk=is_ntk,
-                                         rtol=0.021,
-                                         atol=0.2)
-
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_{}_{}_{}_{}_{}_{}'.format(
-                  model,
-                  width,
-                  'same_inputs' if same_inputs else 'different_inputs',
-                  'NTK' if is_ntk else 'NNGP',
-                  proj_into_2d,
-                  'layer_norm=%s' % str(layer_norm)),
-          'model':
-              model,
-          'width':
-              width,
-          'same_inputs':
-              same_inputs,
-          'is_ntk':
-              is_ntk,
-          'proj_into_2d':
-              proj_into_2d,
-          'layer_norm':
-              layer_norm
-      }
-                          for model in MODELS
-                          for width in WIDTHS
-                          for same_inputs in [False]
-                          for is_ntk in [False, True]
-                          for proj_into_2d in PROJECTIONS[:2]
-                          for layer_norm in LAYER_NORM))
-  def test_layernorm(self,
-                     model,
-                     width,
-                     same_inputs,
-                     is_ntk,
-                     proj_into_2d,
-                     layer_norm):
     is_conv = 'conv' in model
     # Check for duplicate / incorrectly-shaped NN configs / wrong backend.
     if is_conv:
@@ -538,43 +454,34 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
 
     net = _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res,
                    padding, phi, strides, width, is_ntk, proj_into_2d,
-                   pool_type, layer_norm, parameterization, use_dropout)
-    self._check_agreement_with_empirical(net, same_inputs, use_dropout, is_ntk,
-                                         0.07)
+                   pool_type, layer_norm, parameterization, 1, use_dropout)
+    _check_agreement_with_empirical(self, net, same_inputs, use_dropout, is_ntk,
+                                    0.07)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_{}_{}_{}_{}_{}_{}_{}_{}'.format(
-                  width, 'same_inputs' if same_inputs else 'different_inputs',
-                  'filter_shape=%s' % str(filter_shape), 'padding=%s' %
-                  padding, 'strides=%s' % str(strides),
-                  'NTK' if is_ntk else 'NNGP', 'pool_type=%s' %
-                  str(pool_type), 'normalize_edges=%s' % str(normalize_edges)),
-          'width':
-              width,
-          'same_inputs':
-              same_inputs,
-          'is_ntk':
-              is_ntk,
-          'pool_type':
-              pool_type,
-          'padding':
-              padding,
-          'filter_shape':
-              filter_shape,
-          'strides':
-              strides,
-          'normalize_edges':
-              normalize_edges
-      } for width in WIDTHS for same_inputs in [False]
-                          for is_ntk in [False, True]
-                          for pool_type in POOL_TYPES for padding in PADDINGS
-                          for filter_shape in FILTER_SHAPES
-                          for strides in STRIDES
-                          for normalize_edges in [True, False]))
-  def test_pool(self, width, same_inputs, is_ntk, pool_type,
-                padding, filter_shape, strides, normalize_edges):
+  @test_utils.product(
+      width=WIDTHS,
+      same_inputs=[False],
+      is_ntk=[False, True],
+      pool_type=[
+          'SUM',
+          'AVG'
+      ],
+      padding=PADDINGS,
+      filter_shape=FILTER_SHAPES,
+      strides=STRIDES,
+      normalize_edges=[True, False]
+  )
+  def test_pool(
+      self,
+      width,
+      same_inputs,
+      is_ntk,
+      pool_type,
+      padding,
+      filter_shape,
+      strides,
+      normalize_edges
+  ):
     use_dropout = False
     # Check for duplicate / incorrectly-shaped NN configs / wrong backend.
     test_utils.skip_test(self)
@@ -583,7 +490,7 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
 
     net = _get_net_pool(width, is_ntk, pool_type,
                         padding, filter_shape, strides, normalize_edges)
-    self._check_agreement_with_empirical(net, same_inputs, use_dropout, is_ntk)
+    _check_agreement_with_empirical(self, net, same_inputs, use_dropout, is_ntk)
 
   def test_avg_pool(self):
     X1 = np.ones((4, 2, 3, 2))
@@ -632,45 +539,31 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
     cov2 = np.broadcast_to(np.expand_dims(ker_unnorm, 0), ker.cov2.shape)
     self.assertAllClose((nngp, cov1, cov2), (ker.nngp, ker.cov1, ker.cov2))
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              '_{}_{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(
-                  model, phi_name, width, 'same_inputs'
-                  if same_inputs else 'different_inputs', 'filter_shape=%s' %
-                  str(filter_shape), 'padding=%s' % padding, 'strides=%s' %
-                  str(strides), 'pool' if use_pooling else 'flatten',
-                  'NTK' if is_ntk else 'NNGP', proj_into_2d),
-          'model':
-              model,
-          'width':
-              width,
-          'same_inputs':
-              same_inputs,
-          'is_ntk':
-              is_ntk,
-          'padding':
-              padding,
-          'strides':
-              strides,
-          'filter_shape':
-              filter_shape,
-          'phi':
-              phi,
-          'use_pooling':
-              use_pooling,
-          'proj_into_2d':
-              proj_into_2d
-      } for model in MODELS for width in WIDTHS
-                          for same_inputs in [True, False]
-                          for phi, phi_name in ACTIVATIONS.items()
-                          for padding in ['SAME'] for strides in STRIDES
-                          for filter_shape in [(2, 1)]
-                          for is_ntk in [True, False]
-                          for use_pooling in [True, False]
-                          for proj_into_2d in ['FLAT', 'POOL']))
-  def test_dropout(self, model, width, same_inputs, is_ntk, padding, strides,
-                   filter_shape, phi, use_pooling, proj_into_2d):
+  @test_utils.product(
+      model=MODELS,
+      width=WIDTHS,
+      same_inputs=[True, False],
+      phi=ACTIVATIONS,
+      padding=['SAME'],
+      strides=STRIDES,
+      filter_shape=[(2, 1)],
+      is_ntk=[True, False],
+      use_pooling=[True, False],
+      proj_into_2d=['FLAT', 'POOL']
+  )
+  def test_dropout(
+      self,
+      model,
+      width,
+      same_inputs,
+      is_ntk,
+      padding,
+      strides,
+      filter_shape,
+      phi,
+      use_pooling,
+      proj_into_2d
+  ):
     pool_type = 'AVG'
     use_dropout = True
     is_conv = 'conv' in model
@@ -684,20 +577,14 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
 
     net = _get_net(W_std, b_std, filter_shape, is_conv, use_pooling, is_res,
                    padding, phi, strides, width, is_ntk, proj_into_2d,
-                   pool_type, layer_norm, parameterization, use_dropout)
-    self._check_agreement_with_empirical(net, same_inputs, use_dropout, is_ntk)
+                   pool_type, layer_norm, parameterization, 1, use_dropout)
+    _check_agreement_with_empirical(self, net, same_inputs, use_dropout, is_ntk)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_act={act}_kernel={kern}_do_stabilize={do_stabilize}',
-          'act': act,
-          'kernel': kern,
-          'do_stabilize': do_stabilize
-      }
-                          for act in ['erf', 'relu']
-                          for do_stabilize in [True, False]
-                          for kern in ['nngp', 'ntk']))
+  @test_utils.product(
+      act=['erf', 'relu'],
+      do_stabilize=[True, False],
+      kernel=['nngp', 'ntk']
+  )
   def test_sparse_inputs(self, act, kernel, do_stabilize):
     if do_stabilize and act != 'relu':
       raise absltest.SkipTest('Stabilization possible only in Relu.')
@@ -713,11 +600,10 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
     samples = N_SAMPLES
 
     if default_backend() == 'gpu':
-      jtu._default_tolerance[onp.dtype(onp.float64)] = 5e-4
+      tol = 5e-4
       samples = 100 * N_SAMPLES
     else:
-      jtu._default_tolerance[onp.dtype(onp.float32)] = 5e-2
-      jtu._default_tolerance[onp.dtype(onp.float64)] = 5e-3
+      tol = {onp.dtype(onp.float32): 5e-2, onp.dtype(onp.float64): 5e-3}
 
     # a batch of dense inputs
     x_dense = random.normal(key, (input_count, input_size))
@@ -739,13 +625,14 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
         samples,
         vmap_axes=0,
         device_count=-1,
-        implementation=2
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION
     )(x_sparse, None, kernel)
     mc = np.reshape(mc, exact.shape)
 
     assert not np.any(np.isnan(exact))
     self.assertAllClose(exact[sparse_count:, sparse_count:],
-                        mc[sparse_count:, sparse_count:])
+                        mc[sparse_count:, sparse_count:],
+                        rtol=tol, atol=tol)
 
   def test_composition_dense(self):
     rng = random.PRNGKey(0)
@@ -765,13 +652,10 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
     composed_ker_out = composed_ker_fn(x1, x2)
     self.assertAllClose(ker_out, composed_ker_out)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name': '_avg_pool={}_same_inputs={}'.format(avg_pool,
-                                                                same_inputs),
-          'avg_pool': avg_pool,
-          'same_inputs': same_inputs
-      } for avg_pool in [True, False] for same_inputs in [True, False]))
+  @test_utils.product(
+      avg_pool=[True, False],
+      same_inputs=[True, False]
+  )
   def test_composition_conv(self, avg_pool, same_inputs):
     rng = random.PRNGKey(0)
     x1 = random.normal(rng, (3, 5, 5, 3))
@@ -803,67 +687,133 @@ class StaxTest(test_utils.NeuralTangentsTestCase):
                                                  diagonal_spatial=True))
       self.assertAllClose(composed_ker_out, ker_out_marg)
 
-  def _check_agreement_with_empirical(
+
+class ParameterizationTest(test_utils.NeuralTangentsTestCase):
+
+  @test_utils.product(
+      get=['nngp', 'ntk'],
+      s=[2**9, 2**8, 2**7],
+      depth=[0, 1, 2],
+      same_inputs=[True, False],
+      W_std=[0., 1., 2.],
+      b_std=[None, 0., 0.5**0.5, 2],
+      parameterization=['ntk', 'standard']
+  )
+  def test_linear(
       self,
-      net,
+      get,
+      s,
+      depth,
       same_inputs,
-      use_dropout,
-      is_ntk,
-      rtol=RTOL,
-      atol=ATOL
+      b_std,
+      W_std,
+      parameterization,
   ):
-    ((init_fn, apply_fn, kernel_fn),
-     input_shape, device_count, channel_axis) = net
-
-    num_samples = N_SAMPLES * 5 if use_dropout else N_SAMPLES
-    key = random.PRNGKey(1)
-    x1, x2 = _get_inputs(key, same_inputs, input_shape)
-    if default_backend() == 'tpu' and use_dropout:
-      # including a test case for tpu + dropout with (parallel + batching)
-      batch_size = 2
+    if parameterization == 'standard':
+      width = 2**9 // s
+    elif parameterization == 'ntk':
+      if s != 2**9:
+        raise absltest.SkipTest(
+            '"ntk" parameterization does not depend on "s".')
+      width = 2**10
     else:
-      batch_size = 0
-    x1_out_shape, params = init_fn(key, x1.shape)
-    if same_inputs:
-      assert x2 is None
-    if x2 is None:
-      x2_out_shape = x1_out_shape
-    else:
-      x2_out_shape, params = init_fn(key, x2.shape)
-    del params
+      raise ValueError(parameterization)
 
-    def _get_empirical(n_samples, get):
-      kernel_fn_empirical = nt.monte_carlo_kernel_fn(
-          init_fn, apply_fn, key, n_samples, device_count=device_count,
-          trace_axes=(channel_axis,), batch_size=batch_size,
-          implementation=2
-      )
-      if same_inputs:
-        assert x2 is None
-      return kernel_fn_empirical(x1, x2, get)
+    layers = []
+    for i in range(depth + 1):
+      s_in = 1 if i == 0 else s
+      s_out = 1 if (i == depth and get == 'ntk') else s
+      out_dim = 1 if (i == depth and get == 'ntk') else width * (i + 1)
+      layers += [stax.Dense(out_dim,
+                            W_std=W_std / (i + 1),
+                            b_std=b_std if b_std is None else b_std / (i + 1),
+                            parameterization=parameterization,
+                            s=(s_in, s_out))]
 
-    if is_ntk:
-      exact, shape1, shape2 = kernel_fn(x1, x2, ('ntk', 'shape1', 'shape2'))
-      empirical = _get_empirical(num_samples, 'ntk')
-    else:
-      exact, shape1, shape2 = kernel_fn(x1, x2, ('nngp', 'shape1', 'shape2'))
-      empirical = _get_empirical(num_samples, 'nngp')
-    test_utils.assert_close_matrices(self, exact, empirical, rtol, atol)
-    self.assertEqual(shape1, x1_out_shape)
-    self.assertEqual(shape2, x2_out_shape)
+    net = stax.serial(*layers)
+    net = net, (BATCH_SIZE, 3), -1, 1
+    _check_agreement_with_empirical(
+        self, net, same_inputs, False, get == 'ntk', rtol=0.02, atol=10)
+
+  @test_utils.product(
+      model=MODELS,
+      width=[2**10],
+      same_inputs=[False],
+      is_ntk=[False, True],
+      filter_shape=FILTER_SHAPES,
+      proj_into_2d=PROJECTIONS[:2],
+      W_std=[0., 1., 2.],
+      b_std=[None, 0., 0.5**0.5],
+      parameterization=['ntk', 'standard'],
+      s=[2**10]
+  )
+  def test_nonlinear(
+      self,
+      model,
+      width,
+      same_inputs,
+      is_ntk,
+      filter_shape,
+      proj_into_2d,
+      b_std,
+      W_std,
+      parameterization,
+      s
+  ):
+    is_conv = 'conv' in model
+
+    if parameterization == 'standard':
+      width //= s
+
+    padding = PADDINGS[0]
+    strides = STRIDES[0]
+    phi = stax.Relu()
+    use_pooling, is_res = False, False
+    layer_norm = None
+    pool_type = 'AVG'
+    use_dropout = False
+
+    # Check for duplicate / incorrectly-shaped NN configs / wrong backend.
+    if is_conv:
+      test_utils.skip_test(self)
+    elif proj_into_2d != PROJECTIONS[0] or filter_shape != FILTER_SHAPES[0]:
+      raise absltest.SkipTest('FC models do not have these parameters.')
+
+    net = _get_net(W_std=W_std,
+                   b_std=b_std,
+                   filter_shape=filter_shape,
+                   is_conv=is_conv,
+                   use_pooling=use_pooling,
+                   is_res=is_res,
+                   padding=padding,
+                   phi=phi,
+                   strides=strides,
+                   width=width,
+                   is_ntk=is_ntk,
+                   proj_into_2d=proj_into_2d,
+                   pool_type=pool_type,
+                   layer_norm=layer_norm,
+                   parameterization=parameterization,
+                   s=s,
+                   use_dropout=use_dropout)
+
+    _check_agreement_with_empirical(
+        self,
+        net=net,
+        same_inputs=same_inputs,
+        use_dropout=use_dropout,
+        is_ntk=is_ntk,
+        rtol=0.015,
+        atol=1000
+    )
 
 
 class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_same_inputs={same_inputs}_kernel_type={kernel_type}',
-          'same_inputs': same_inputs,
-          'kernel_type': kernel_type
-      }
-                          for same_inputs in [True, False]
-                          for kernel_type in ['ntk']))
+  @test_utils.product(
+      same_inputs=[True, False],
+      kernel_type=['ntk']
+  )
   def test_parallel_in(self, same_inputs, kernel_type):
     platform = default_backend()
     rtol = RTOL if platform != 'tpu' else 0.05
@@ -888,7 +838,7 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
 
     kernel_fn_empirical = nt.monte_carlo_kernel_fn(
         init_fn, apply_fn, mc_key, N_SAMPLES, trace_axes=(-1,),
-        implementation=2,
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION,
         vmap_axes=((0, 0), 0, {})
     )
     test_utils.assert_close_matrices(self,
@@ -896,13 +846,10 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
                                      kernel_fn_empirical(x1, x2, kernel_type),
                                      rtol)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_same_inputs={same_inputs}_kernel_type={kernel_type}',
-          'same_inputs': same_inputs,
-          'kernel_type': kernel_type
-      } for same_inputs in [True, False] for kernel_type in ['ntk']))
+  @test_utils.product(
+      same_inputs=[True, False],
+      kernel_type=['ntk']
+  )
   def test_parallel_out(self, same_inputs, kernel_type):
     platform = default_backend()
     rtol = RTOL if platform != 'tpu' else 0.05
@@ -924,7 +871,7 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
 
     kernel_fn_empirical = nt.monte_carlo_kernel_fn(
         init_fn, apply_fn, mc_key, N_SAMPLES, trace_axes=(-1,),
-        implementation=2,
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION,
         vmap_axes=(0, [0, 0], {}))
 
     test_utils.assert_close_matrices(self,
@@ -932,13 +879,10 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
                                      kernel_fn_empirical(x1, x2, kernel_type),
                                      rtol)
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_same_inputs={same_inputs}_kernel_type={kernel_type}',
-          'same_inputs': same_inputs,
-          'kernel_type': kernel_type,
-      } for same_inputs in [True, False] for kernel_type in ['ntk']))
+  @test_utils.product(
+      same_inputs=[True, False],
+      kernel_type=['ntk']
+  )
   def test_parallel_in_out(self, same_inputs, kernel_type):
     platform = default_backend()
     rtol = RTOL if platform != 'tpu' else 0.05
@@ -968,7 +912,7 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
 
     kernel_fn_empirical = nt.monte_carlo_kernel_fn(
         init_fn, apply_fn, mc_key, N_SAMPLES, trace_axes=(-1,),
-        implementation=2,
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION,
         vmap_axes=((0, 0), [0, 0, 0], {})
     )
 
@@ -984,13 +928,10 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
 
     K_readout_fn(K_readin_fn(x1, x2))
 
-  @parameterized.named_parameters(
-      jtu.cases_from_list({
-          'testcase_name':
-              f'_same_inputs={same_inputs}_kernel_type={kernel_type}',
-          'same_inputs': same_inputs,
-          'kernel_type': kernel_type,
-      } for same_inputs in [True, False] for kernel_type in ['ntk']))
+  @test_utils.product(
+      same_inputs=[True, False],
+      kernel_type=['ntk']
+  )
   def test_nested_parallel(self, same_inputs, kernel_type):
     platform = default_backend()
     rtol = RTOL if platform != 'tpu' else 0.05
@@ -1040,7 +981,11 @@ class ParallelInOutTest(test_utils.NeuralTangentsTestCase):
         stax.Conv(N_in + 3, (2,)))
 
     kernel_fn_empirical = nt.monte_carlo_kernel_fn(
-        init_fn, apply_fn, mc_key, N_SAMPLES, implementation=2,
+        init_fn=init_fn,
+        apply_fn=stax.unmask_fn(apply_fn),
+        key=mc_key,
+        n_samples=N_SAMPLES,
+        implementation=_DEFAULT_TESTING_NTK_IMPLEMENTATION,
         vmap_axes=(((((0, 0), 0), 0), (((0, 0), 0), 0), {})
                    if platform == 'tpu' else None)
     )

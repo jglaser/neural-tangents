@@ -19,17 +19,18 @@ from typing import Any, Callable, Dict, List
 import warnings
 
 import frozendict
+from jax import random
 import jax.example_libraries.stax as ostax
 from .requirements import Diagonal, get_req, layer, requires
 from ..utils.kernel import Kernel
-from ..utils.typing import InternalLayer, Layer, LayerKernelFn, NTTree, NTTrees
+from ..utils.typing import InternalLayer, Layer, LayerKernelFn, NTTree, NTTrees, Shapes
 
 
 @layer
 def serial(*layers: Layer) -> InternalLayer:
   """Combinator for composing layers in serial.
 
-  Based on `jax.example_libraries.stax.serial`.
+  Based on :obj:`jax.example_libraries.stax.serial`.
 
   Args:
     *layers:
@@ -57,9 +58,10 @@ def serial(*layers: Layer) -> InternalLayer:
 def parallel(*layers: Layer) -> InternalLayer:
   """Combinator for composing layers in parallel.
 
-  The layer resulting from this combinator is often used with the `FanOut` and
-  `FanInSum`/`FanInConcat` layers. Based on
-  `jax.example_libraries.stax.parallel`.
+  The layer resulting from this combinator is often used with the
+  :obj:`~neural_tangents.stax.FanOut`, :obj:`~neural_tangents.stax.FanInSum`,
+  and :obj:`~neural_tangents.stax.FanInConcat` layers. Based on
+  :obj:`jax.example_libraries.stax.parallel`.
 
   Args:
     *layers:
@@ -74,7 +76,7 @@ def parallel(*layers: Layer) -> InternalLayer:
   init_fns, apply_fns, kernel_fns = zip(*layers)
   init_fn_stax, apply_fn_stax = ostax.parallel(*zip(init_fns, apply_fns))
 
-  def init_fn(rng, input_shape):
+  def init_fn(rng: random.KeyArray, input_shape: Shapes):
     return type(input_shape)(init_fn_stax(rng, input_shape))
 
   def apply_fn(params, inputs, **kwargs):
