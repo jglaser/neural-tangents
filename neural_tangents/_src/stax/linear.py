@@ -2089,10 +2089,10 @@ def GlobalSelfAttention(
   attention_mechanism = AttentionMechanism(attention_mechanism)
 
   @functools.lru_cache(1)
-  def get_pos_emb_L(spatial_shape):
+  def get_pos_emb_L(spatial_shape, dtype):
     with jax.core.eval_context():
       size = utils.size_at(spatial_shape)
-      R = _pos_emb_pdist(spatial_shape, pos_emb_p_norm, pos_emb_decay_fn)
+      R = _pos_emb_pdist(spatial_shape, dtype, pos_emb_p_norm, pos_emb_decay_fn)
       R = utils.unzip_axes(R)
       L = np.linalg.cholesky(np.reshape(R, (size,) * 2)).reshape(R.shape)
       return L
@@ -2161,7 +2161,7 @@ def GlobalSelfAttention(
     if pos_emb is not None:
       # Generate positional embeddings.
       if pos_emb_decay_fn is not None:
-        L = get_pos_emb_L(spatial_shape)
+        L = get_pos_emb_L(spatial_shape, inputs.dtype)
         first = tuple(range(L.ndim // 2))
         last = tuple(range(L.ndim // 2, L.ndim))
         pos_emb = np.tensordot(L, pos_emb, (last, spatial_axes))
@@ -2261,7 +2261,7 @@ def GlobalSelfAttention(
     R1, R12, R2 = _get_all_pos_emb(k, pos_emb_type, pos_emb_p_norm,
                                    pos_emb_decay_fn)
 
-    def _get_interpolation_coefficients():
+    def _get_interpolation_coefficients(dtype):
       input_weight, pos_emb_weight = 1, W_pos_emb_std**2
 
       if pos_emb_type == PositionalEmbedding.CONCAT:
@@ -2271,8 +2271,8 @@ def GlobalSelfAttention(
                            else n_chan_pos_emb)
         n_chan_total = n_chan_input + _n_chan_pos_emb
 
-        input_weight *= n_chan_input / n_chan_total
-        pos_emb_weight *= _n_chan_pos_emb / n_chan_total
+        input_weight *= np.array(n_chan_input / n_chan_total).astype(dtype)
+        pos_emb_weight *= np.array(_n_chan_pos_emb / n_chan_total).astype(dtype)
 
       return input_weight, pos_emb_weight
 
@@ -2282,7 +2282,7 @@ def GlobalSelfAttention(
       return x_weight * x + y_weight * y
 
     # Generate kernel interpolations.
-    kern_weight, pos_emb_weight = _get_interpolation_coefficients()
+    kern_weight, pos_emb_weight = _get_interpolation_coefficients(k.cov1.dtype)
 
     cov1_interp = weighted_sum(k.cov1, R1, kern_weight, pos_emb_weight)
     cov2_interp = weighted_sum(k.cov2, R2, kern_weight, pos_emb_weight)
@@ -3705,24 +3705,25 @@ def _pooling_layer(reducer, init_val, rescaler=None):
 # POSITIONAL EMBEDDINGS
 
 
-def _pos_emb_identity(shape: Sequence[int]) -> np.ndarray:
+def _pos_emb_identity(shape: Sequence[int], dtype: np.dtype) -> np.ndarray:
   size = utils.size_at(shape)
-  R = np.eye(size).reshape(tuple(shape) * 2)
+  R = np.eye(size, dtype=dtype).reshape(tuple(shape) * 2)
   R = utils.zip_axes(R)
   return R
 
 
 def _pos_emb_pdist(shape: Sequence[int],
+                   dtype: np.dtype,
                    pos_emb_p_norm: Optional[float],
                    pos_emb_decay_fn: Optional[Callable[[float], float]]
                    ) -> np.ndarray:
   if pos_emb_decay_fn is None:
     # Identity / one-hot positional embeddings.
-    return _pos_emb_identity(shape)
+    return _pos_emb_identity(shape, dtype)
 
   # Pairwise distance-based positional embeddings.
   ndim = len(shape)
-  R = np.zeros((1,) * (ndim * 2))
+  R = np.zeros((1,) * (ndim * 2), dtype=dtype)
   for axis in range(ndim):
     d = np.arange(shape[axis])
     pd = utils.outer_prod(d, d, 0, d.ndim, op.sub)
@@ -3746,7 +3747,7 @@ def _get_all_pos_emb(k: Kernel,
     return None, None, None
 
   shape, _ = _shape_and_axes(k.shape1, (k.batch_axis, k.channel_axis))
-  R = _pos_emb_pdist(shape, pos_emb_p_norm, pos_emb_decay_fn)
+  R = _pos_emb_pdist(shape, k.cov1.dtype, pos_emb_p_norm, pos_emb_decay_fn)
 
   if k.is_reversed:
     R = utils.reverse_zipped(R)
